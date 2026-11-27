@@ -31,5 +31,6 @@ F-001 16 requests / 4 hosts, one inference · F-002 single `main` inference requ
 
 ## Suggestions
 - Turn on `store_streamed_bodies` to get a second, independent copy of each stream for T1.
+- The inference stream is stored gzip-compressed, as received (F-008). Let `tools/extract` write a decompressed copy next to it as a derived file (e.g. `<flow.id>.sse.txt`, regenerable, never the source of truth), so the reply can be read without `gunzip`.
 - `viamitm` sets only `HTTPS_PROXY` as specified; a plain-HTTP request would bypass the proxy unseen. Also set `HTTP_PROXY`, and record TLS handshake failures (clients that reject the CA) in the addon, so P1 can see uncaptured hosts.
 - README has no owner in the table and has no usage section yet.
