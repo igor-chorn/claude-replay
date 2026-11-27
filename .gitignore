@@ -1,0 +1,16 @@
+# Recorded traffic: credentials, account ids, full prompts. Never commit.
+logs/
+*.mitm
+*.sse
+*.har
+
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
