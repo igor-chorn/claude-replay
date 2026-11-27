@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Sanitized overview of one run directory made by tools/run_case.
+
+    uv run tools/inventory logs/<run-id>
+
+Prints structure only: no header values outside the safelist, no bodies.
+Exit code 1 if anything is unknown or inconsistent (see "Problems" at the end).
+"""
+
+import argparse
+import collections
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
+
+from mitmproxy import http
+from mitmproxy import io as mitm_io
+from mitmproxy.net import encoding
+
+SAFE_HEADER_VALUES = ("anthropic-version", "anthropic-beta", "content-type", "x-claude-code-request-class")
+
+# (class, host regex, method regex, path regex) — full match, path without query.
+# Only endpoints that were observed and recorded in docs/FINDINGS.md, or that
+# are documented (E-1), belong here. Everything else is UNKNOWN.
+API = r"api\.anthropic\.com"
+RULES = [
+    ("inference", API, "POST", r"/v1/messages"),
+    ("count_tokens", API, "POST", r"/v1/messages/count_tokens"),
+    ("telemetry", API, "POST", r"/api/event_logging/v2/batch"),
+    ("telemetry", r"http-intake\.logs\.us5\.datadoghq\.com", "POST", r"/api/v2/logs"),
+    ("feature_flags", API, "POST", r"/api/eval/sdk-[A-Za-z0-9]+"),
+    ("client_config", API, "GET", r"/api/claude_cli/bootstrap"),
+    ("client_config", API, "GET", r"/api/claude_code_penguin_mode"),
+    ("plugin_registry", API, "GET", r"/api/oauth/organizations/[^/]+/plugins/list-plugins"),
+    ("plugin_registry", API, "GET", r"/api/oauth/organizations/[^/]+/marketplaces"),
+    ("mcp_registry", API, "GET", r"/v1/mcp_servers"),
+    ("mcp_registry", API, "GET", r"/api/directory/server-urls"),
+    ("mcp", r"mcp-proxy\.anthropic\.com", "POST", r"/v1/mcp/[^/]+"),
+    ("mcp", r"api\.githubcopilot\.com", "GET|POST", r"/mcp/"),
+]
+# A flow of these classes without a complete response is a problem; for the
+# rest (e.g. telemetry cut off when the CLI exits) it is only a note.
+MUST_COMPLETE = {"inference", "count_tokens", "UNKNOWN"}
+
+KNOWN_SSE_EVENTS = {
+    "message_start", "content_block_start", "content_block_delta", "content_block_stop",
+    "message_delta", "message_stop", "ping", "error",
+}
+KNOWN_BLOCK_TYPES = {"text", "thinking", "redacted_thinking", "tool_use"}
+KNOWN_DELTA_TYPES = {"text_delta", "thinking_delta", "signature_delta", "input_json_delta"}
+USAGE_FIELDS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
+
+def classify(method: str, host: str, path: str) -> str:
+    path = path.split("?", 1)[0]
+    for cls, host_re, rule_method, path_re in RULES:
+        if re.fullmatch(rule_method, method) and re.fullmatch(host_re, host) and re.fullmatch(path_re, path):
+            return cls
+    return "UNKNOWN"
+
+
+def sanitize_path(path: str) -> str:
+    """Mask path segments and query values that could be identifiers."""
+    parts = urlsplit(path)
+    segs = []
+    for seg in parts.path.split("/"):
+        if UUID_RE.fullmatch(seg):
+            seg = "<uuid>"
+        elif "@" in seg or (len(seg) >= 16 and re.search(r"[0-9A-Z]", seg)):
+            seg = "<id>"
+        segs.append(seg)
+    out = "/".join(segs)
+    if parts.query:
+        pairs = parse_qsl(parts.query, keep_blank_values=True)
+        out += "?" + "&".join(
+            f"{k}={v}" if re.fullmatch(r"true|false|\d{1,6}", v) else f"{k}=<v>" for k, v in pairs
+        )
+    return out
+
+
+def parse_sse(data: bytes) -> list[tuple[str, str]]:
+    """Return (event, data) pairs; raises ValueError on non-UTF-8 input."""
+    text = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    events = []
+    for block in text.split("\n\n"):
+        name, payload, seen = "message", [], False
+        for line in block.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            field, _, value = line.partition(":")
+            value = value.removeprefix(" ")
+            if field == "event":
+                name, seen = value, True
+            elif field == "data":
+                payload.append(value)
+                seen = True
+        if seen:
+            events.append((name, "\n".join(payload)))
+    return events
+
+
+def usage_numbers(usage) -> dict:
+    if not isinstance(usage, dict):
+        return {}
+    return {k: usage[k] for k in USAGE_FIELDS if isinstance(usage.get(k), int)}
+
+
+def summarize_sse(data: bytes, problems: list[str], label: str) -> dict:
+    out = {"events": collections.Counter(), "blocks": collections.Counter(), "deltas": collections.Counter(),
+           "id": None, "model": None, "stop_reason": None, "usage_start": {}, "usage": {}}
+    try:
+        events = parse_sse(data)
+    except ValueError as e:
+        problems.append(f"{label}: SSE stream is not UTF-8 ({e.reason})")
+        return out
+    if data and not data.replace(b"\r\n", b"\n").replace(b"\r", b"\n").endswith(b"\n\n"):
+        problems.append(f"{label}: SSE stream does not end with a complete event")
+    for name, payload in events:
+        out["events"][name] += 1
+        if name not in KNOWN_SSE_EVENTS:
+            problems.append(f"{label}: unknown SSE event type {name!r}")
+            continue
+        try:
+            obj = json.loads(payload)
+        except ValueError:
+            problems.append(f"{label}: SSE event {name!r} has non-JSON data")
+            continue
+        if obj.get("type") != name:
+            problems.append(f"{label}: SSE event {name!r} carries data type {obj.get('type')!r}")
+        if name == "message_start":
+            msg = obj.get("message", {})
+            out["id"], out["model"] = msg.get("id"), msg.get("model")
+            out["usage_start"] = usage_numbers(msg.get("usage"))
+            out["usage"] = dict(out["usage_start"])
+        elif name == "content_block_start":
+            kind = obj.get("content_block", {}).get("type")
+            out["blocks"][kind] += 1
+            if kind not in KNOWN_BLOCK_TYPES:
+                problems.append(f"{label}: unknown content block type {kind!r}")
+        elif name == "content_block_delta":
+            kind = obj.get("delta", {}).get("type")
+            out["deltas"][kind] += 1
+            if kind not in KNOWN_DELTA_TYPES:
+                problems.append(f"{label}: unknown delta type {kind!r}")
+        elif name == "message_delta":
+            out["stop_reason"] = obj.get("delta", {}).get("stop_reason")
+            out["usage"].update(usage_numbers(obj.get("usage")))
+        elif name == "error":
+            problems.append(f"{label}: SSE error event of type {obj.get('error', {}).get('type')!r}")
+    return out
+
+
+def summarize_request(body: bytes, problems: list[str], label: str) -> dict | None:
+    try:
+        req = json.loads(body)
+    except ValueError:
+        problems.append(f"{label}: request body is not JSON")
+        return None
+    system = req.get("system")
+    messages = req.get("messages") or []
+    tools = req.get("tools") or []
+    system_blocks = system if isinstance(system, list) else []
+    message_blocks = [b for m in messages if isinstance(m.get("content"), list) for b in m["content"]]
+
+    roles = collections.Counter(str(m.get("role")) for m in messages)
+    block_types = collections.Counter(str(b.get("type")) if isinstance(b, dict) else "?" for b in message_blocks)
+    block_types["(string content)"] = sum(isinstance(m.get("content"), str) for m in messages)
+
+    def marked(blocks):
+        return [b["cache_control"] for b in blocks if isinstance(b, dict) and "cache_control" in b]
+
+    markers = {"system": marked(system_blocks), "messages": marked(message_blocks), "tools": marked(tools)}
+    return {
+        "model": req.get("model"),
+        "stream": req.get("stream"),
+        "keys": list(req),
+        "system": "absent" if system is None else "string" if isinstance(system, str) else f"{len(system)} blocks",
+        "messages": len(messages),
+        "roles": roles,
+        "message_block_types": +block_types,
+        "tools": len(tools),
+        "cache_control": {k: len(v) for k, v in markers.items()},
+        "cache_control_values": sorted({json.dumps(v, sort_keys=True) for vs in markers.values() for v in vs}),
+        "thinking": json.dumps(req["thinking"], sort_keys=True) if "thinking" in req else "absent",
+    }
+
+
+def read_sidecar(path: Path) -> dict:
+    info = {"chunks": 0, "end": None, "content_encoding": ""}
+    for line in path.read_text().splitlines():
+        rec = json.loads(line)
+        if rec["event"] == "chunk":
+            info["chunks"] += 1
+        elif rec["event"] == "start":
+            info["content_encoding"] = rec.get("content_encoding", "")
+        elif rec["event"] == "end":
+            info["end"] = rec
+    return info
+
+
+def read_cli(run_dir: Path, problems: list[str]) -> dict:
+    """Assistant message ids/usage and result events from the saved stream-json output."""
+    cli = {"types": collections.Counter(), "messages": {}, "results": []}
+    for path in sorted(run_dir.glob("steps/*/stdout.jsonl")):
+        step = path.parent.name
+        for n, line in enumerate(path.read_text(errors="replace").splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                problems.append(f"step {step}: stdout line {n} is not JSON")
+                continue
+            kind = ev.get("type")
+            cli["types"][f"{kind}/{ev['subtype']}" if ev.get("subtype") else str(kind)] += 1
+            if kind == "assistant":
+                msg = ev.get("message", {})
+                cli["messages"].setdefault(msg.get("id"), []).append(usage_numbers(msg.get("usage")))
+            elif kind == "result":
+                cli["results"].append({
+                    "step": step,
+                    "subtype": ev.get("subtype"),
+                    "is_error": ev.get("is_error"),
+                    "num_turns": ev.get("num_turns"),
+                    "result_chars": len(ev["result"]) if isinstance(ev.get("result"), str) else None,
+                    "usage": usage_numbers(ev.get("usage")),
+                })
+    return cli
+
+
+def fmt_usage(usage: dict) -> str:
+    return " ".join(f"{k}={usage.get(k, '-')}" for k in USAGE_FIELDS)
+
+
+def fmt_counter(counter) -> str:
+    return ", ".join(f"{k} x{v}" for k, v in sorted(counter.items(), key=lambda kv: str(kv[0]))) or "-"
+
+
+def yesno(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("run_dir", type=Path)
+    args = ap.parse_args(argv)
+    run_dir = args.run_dir
+    flows_path = run_dir / "flows.mitm"
+    if not flows_path.is_file():
+        print(f"inventory: {flows_path} not found", file=sys.stderr)
+        return 2
+
+    problems: list[str] = []
+    notes: list[str] = []
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.is_file():
+        m = json.loads(manifest_path.read_text())
+        print("== Run ==")
+        print(f"run id: {m.get('run_id')}   case: {m.get('case')}   model flag: {m.get('model')}")
+        print(f"claude code: {m.get('claude_code_version')}   mitmproxy: {m.get('mitmproxy_version')}")
+        print(f"auth kind: {m.get('auth_kind')}   started: {m.get('started_at')}   ended: {m.get('ended_at')}")
+        print("steps: " + ", ".join(f"{s.get('n')}:exit={s.get('exit_code')}" for s in m.get("steps", [])))
+        print(f"claude env names: {' '.join(m.get('claude_env_names', []))}")
+        if m.get("error"):
+            problems.append(f"manifest records an error: {m['error']}")
+    else:
+        problems.append("manifest.json is missing")
+
+    rows = []
+    groups = collections.defaultdict(lambda: {"n": 0, "req": 0, "resp": 0, "headers": set(),
+                                             "safe": collections.defaultdict(set)})
+    inference = []
+    seen_ids = set()
+    with open(flows_path, "rb") as f:
+        flows = list(mitm_io.FlowReader(f).stream())
+
+    for idx, flow in enumerate(flows, start=1):
+        label = f"flow {idx}"
+        seen_ids.add(flow.id)
+        if not isinstance(flow, http.HTTPFlow):
+            rows.append((idx, "UNKNOWN", type(flow).__name__, "-", "-", "-", 0, "-", 0, "-", 0, "-"))
+            problems.append(f"{label}: UNKNOWN flow type {type(flow).__name__}")
+            continue
+        req, resp = flow.request, flow.response
+        host = req.pretty_host
+        cls = classify(req.method, host, req.path)
+        path = sanitize_path(req.path)
+        if cls == "UNKNOWN":
+            problems.append(f"{label}: UNKNOWN endpoint {req.method} {host}{path.split('?')[0]}")
+        req_body = req.raw_content or b""
+
+        sse_path = run_dir / "streams" / f"{flow.id}.sse"
+        sidecar_path = run_dir / "streams" / f"{flow.id}.chunks.jsonl"
+        streamed = sidecar_path.is_file()
+        chunks, body, body_encoding = 0, b"", ""
+        if resp is not None:
+            body = resp.raw_content or b""
+            body_encoding = resp.headers.get("content-encoding", "")
+        if streamed:
+            side = read_sidecar(sidecar_path)
+            chunks = side["chunks"]
+            body = sse_path.read_bytes() if sse_path.is_file() else b""
+            body_encoding = side["content_encoding"]
+            end = side["end"]
+            if not sse_path.is_file():
+                problems.append(f"{label}: sidecar without stream file")
+            elif end is None or end.get("reason") != "eof":
+                problems.append(f"{label}: stream did not end cleanly ({end and end.get('reason')})")
+            elif end["total"] != len(body) or end["sha256"] != hashlib.sha256(body).hexdigest():
+                problems.append(f"{label}: stream file does not match the size/sha256 in its sidecar")
+        elif resp is not None and resp.headers.get("content-type", "").startswith("text/event-stream"):
+            problems.append(f"{label}: event-stream response without a tee file")
+        if resp is None:
+            reason = flow.error.msg if flow.error else "incomplete"
+            (problems if cls in MUST_COMPLETE else notes).append(f"{label}: {cls} flow has no response ({reason})")
+
+        duration = "-"
+        if resp is not None and resp.timestamp_end and req.timestamp_start:
+            duration = f"{resp.timestamp_end - req.timestamp_start:.2f}"
+        ctype = resp.headers.get("content-type", "-") if resp is not None else "-"
+        rows.append((idx, cls, req.method, host, path, resp.status_code if resp is not None else "-",
+                     len(req_body), ctype, len(body), yesno(streamed), chunks, duration))
+
+        g = groups[(cls, host, path.split("?")[0])]
+        g["n"] += 1
+        g["req"] += len(req_body)
+        g["resp"] += len(body)
+        for name, value in req.headers.items(multi=True):
+            g["headers"].add(name.lower())
+            if name.lower() in SAFE_HEADER_VALUES:
+                g["safe"][name.lower()].add(value)
+
+        if cls == "inference":
+            entry = {"idx": idx, "request": summarize_request(req_body, problems, label), "response": None,
+                     "status": resp.status_code if resp is not None else None,
+                     "request_class": req.headers.get("x-claude-code-request-class", "-"),
+                     "content_encoding": body_encoding or "-"}
+            if resp is not None:
+                try:
+                    decoded = encoding.decode(body, body_encoding) if body_encoding else body
+                except ValueError:
+                    decoded = None
+                    problems.append(f"{label}: cannot decode content-encoding {body_encoding!r}")
+                if decoded is None:
+                    pass
+                elif ctype.startswith("text/event-stream"):
+                    entry["response"] = summarize_sse(decoded, problems, label)
+                else:
+                    try:
+                        obj = json.loads(decoded)
+                    except ValueError:
+                        obj = {}
+                        problems.append(f"{label}: inference response is neither SSE nor JSON")
+                    if obj.get("type") == "error":
+                        problems.append(f"{label}: API error of type {obj.get('error', {}).get('type')!r}")
+                    usage = usage_numbers(obj.get("usage"))
+                    entry["response"] = {
+                        "events": collections.Counter(), "deltas": collections.Counter(),
+                        "blocks": collections.Counter(b.get("type") for b in obj.get("content", [])),
+                        "id": obj.get("id"), "model": obj.get("model"), "stop_reason": obj.get("stop_reason"),
+                        "usage_start": usage, "usage": usage,
+                    }
+            inference.append(entry)
+
+    streams_dir = run_dir / "streams"
+    if streams_dir.is_dir():
+        for p in sorted(streams_dir.iterdir()):
+            if p.name.split(".")[0] not in seen_ids:
+                problems.append(f"stream file {p.name} belongs to no flow in the dump")
+
+    print(f"\n== Flows ({len(rows)}) ==")
+    print("  # class           method host path status req_bytes resp_content_type resp_bytes streamed chunks seconds")
+    for r in rows:
+        print(f"{r[0]:>3} {r[1]:<15} " + " ".join(str(x) for x in r[2:]))
+
+    print("\n== Totals per host and path ==")
+    for (cls, host, path), g in sorted(groups.items()):
+        print(f"{cls:<15} {host}{path}  flows={g['n']} req_bytes={g['req']} resp_bytes={g['resp']}")
+    per_class = collections.Counter(r[1] for r in rows)
+    print("per class: " + fmt_counter(per_class))
+
+    print("\n== Request headers per host and path (names; values for the safelist only) ==")
+    for (cls, host, path), g in sorted(groups.items()):
+        print(f"{cls} {host}{path}")
+        print("  names: " + " ".join(sorted(g["headers"])))
+        for name in SAFE_HEADER_VALUES:
+            for value in sorted(g["safe"].get(name, ())):
+                print(f"  {name}: {value}")
+
+    print(f"\n== /v1/messages ({len(inference)}) ==")
+    sse_by_id = {}
+    for e in inference:
+        print(f"flow {e['idx']}: status={e['status']} x-claude-code-request-class={e['request_class']}")
+        rq = e["request"]
+        if rq:
+            print(f"  request: model={rq['model']} stream={rq['stream']} system={rq['system']} "
+                  f"messages={rq['messages']} tools={rq['tools']}")
+            print(f"  request keys: {' '.join(rq['keys'])}")
+            print(f"  message roles: {fmt_counter(rq['roles'])}; "
+                  f"message content block types: {fmt_counter(rq['message_block_types'])}")
+            print(f"  cache_control markers: {fmt_counter(rq['cache_control'])}; "
+                  f"values: {' '.join(rq['cache_control_values']) or '-'}")
+            print(f"  thinking: {rq['thinking']}")
+        rs = e["response"]
+        if rs:
+            print(f"  response: id={rs['id']} model={rs['model']} stop_reason={rs['stop_reason']} "
+                  f"content-encoding={e['content_encoding']}")
+            print(f"  sse events: {fmt_counter(rs['events'])}")
+            print(f"  content blocks: {fmt_counter(rs['blocks'])}; deltas: {fmt_counter(rs['deltas'])}")
+            print(f"  usage at message_start: {fmt_usage(rs['usage_start'])}")
+            print(f"  usage final:            {fmt_usage(rs['usage'])}")
+            if rs["id"]:
+                sse_by_id[rs["id"]] = rs
+
+    cli = read_cli(run_dir, problems)
+    print("\n== Cross-check with CLI stream-json output ==")
+    print("cli event types: " + fmt_counter(cli["types"]))
+    for r in cli["results"]:
+        print(f"step {r['step']} result: subtype={r['subtype']} is_error={r['is_error']} "
+              f"num_turns={r['num_turns']} result_chars={r['result_chars']}")
+    total = collections.Counter()
+    for msg_id, usages in cli["messages"].items():
+        rs = sse_by_id.get(msg_id)
+        line = f"message {msg_id}: cli_events={len(usages)} in_sse={yesno(rs is not None)}"
+        if rs is not None:
+            total.update(rs["usage"])
+            cli_usage = usages[-1]
+            line += (f" usage_equals_sse_final={yesno(cli_usage == rs['usage'])}"
+                     f" usage_equals_sse_message_start={yesno(cli_usage == rs['usage_start'])}")
+            diff = [f"{k}: cli={cli_usage.get(k)} sse_final={rs['usage'].get(k)} sse_start={rs['usage_start'].get(k)}"
+                    for k in USAGE_FIELDS if cli_usage.get(k) != rs["usage"].get(k)]
+            if diff:
+                line += "\n    " + "\n    ".join(diff)
+        print(line)
+    if not cli["messages"]:
+        print("no assistant messages in the CLI output")
+    for r in cli["results"]:
+        if len(cli["results"]) == 1:
+            summed = {k: total.get(k, 0) for k in USAGE_FIELDS}
+            print(f"result usage:                     {fmt_usage(r['usage'])}")
+            print(f"sum of sse final usage, cli msgs: {fmt_usage(summed)}")
+            print(f"result usage equals that sum: {yesno(r['usage'] == summed)}")
+    not_in_cli = [i for i in sse_by_id if i not in cli["messages"]]
+    print(f"/v1/messages responses whose id is not in the CLI output: {len(not_in_cli)}")
+
+    print(f"\n== Notes ({len(notes)}) ==")
+    for n in notes:
+        print(f"- {n}")
+    print(f"\n== Problems ({len(problems)}) ==")
+    for p in problems:
+        print(f"! {p}")
+    unknown = per_class.get("UNKNOWN", 0)
+    print(f"UNKNOWN flows: {unknown}")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
