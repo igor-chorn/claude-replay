@@ -18,9 +18,9 @@ from run to run), so most checks below are deterministic.
 
 | Id | Claim | Check | Needs API key |
 |---|---|---|---|
-| P1 | Complete | Every host and path in the recording is classified; no unknowns | no |
-| P2 | Complete | Every assistant `message.id` in the CLI `stream-json` output is found in the log (SSE `message_start`), and the usage summed over the log equals the usage reported by the CLI result | no |
-| T1 | Exact | Request bodies and SSE streams are stored as raw bytes with sha256; unknown event/block types are errors | no |
+| P1 | Complete | Every host and path in the recording is classified; no unknowns; no TLS handshake failures (a client that rejected our CA is traffic we did not see); flows without a response only in class `telemetry` (F-014) | no |
+| P2 | Complete | The set of assistant `message.id`s in the CLI `stream-json` output equals the set of message ids in the logged inference responses, in both directions; the usage in the CLI `result` event equals the final usage summed over those responses, field by field. Per-message usage in the CLI equals `message_start` usage, not final usage (F-010) — informational | no |
+| T1 | Exact | Request bodies and SSE streams are stored as raw bytes, as received (the stream may be gzip, F-008), with sha256; the tee copy equals mitmproxy's own stored copy; decompressed and parsed forms are derived; unknown event/block/delta types are errors | no |
 | T2 | Exact | Chain consistency: request N+1 = messages of request N + assistant message assembled from response N + new user/tool_result content, after normalization. Every other difference is printed as a diff | no |
 | T3 | Exact | Final text assembled from the last SSE response equals `result` in the CLI output | no |
 | D1 | Sufficient | The API accepts the replayed request (HTTP 200, no validation error, thinking signatures accepted) | yes |
@@ -50,6 +50,7 @@ A multi-step case is one session: step 1 is a fresh `claude -p`, later steps use
 Stages:
 
 1. **A1 alone** — debug capture, parsing, P1, P2, T1, T3.
+   Capture and inventory: done (task 001). Clean profile, extract, verify: task 002.
 2. **A1 → A2** — first `--resume` boundary; build the T2 allow-list.
 3. **A1 → A5** — whole chain, token growth, cache behaviour.
 4. **With API key** — re-record group A with the key, replay within minutes: D1–D4, K.
@@ -73,9 +74,17 @@ subagents) come later and are out of scope until this file says otherwise.
 
 - Proxy must not buffer streaming responses: Claude Code reads SSE event by
   event and aborts a stream that stays silent too long.
-- Each recorded session runs in an empty scratch directory with a minimal
-  environment, so that this repository's own `CLAUDE.md` and the parent
-  session's environment do not leak into the recorded context.
+- Each recorded session runs in an empty scratch directory **outside this
+  repository** (Claude Code loads `CLAUDE.md` from ancestor directories, F-012)
+  and with a minimal environment.
+- Two recording profiles. **`clean`** (default, used for all evidence): nothing
+  from the user-level configuration reaches the session — no user `CLAUDE.md`,
+  plugins, MCP servers, hooks, skills or auto memory — while Claude Code's own
+  default system prompt and built-in tools stay as they are. **`as-is`**: the
+  machine's configuration untouched; for comparison only.
+- Credential files are never copied, moved or edited to achieve isolation.
+- Both `HTTPS_PROXY` and `HTTP_PROXY` are set; TLS handshake failures seen by
+  the proxy are recorded.
 - Each run has a manifest: tool versions, flags, timestamps, exit codes, and the
   kind of authentication used (`api_key` or `oauth` — the kind only).
 - Recordings made under a subscription login are for tool debugging only.

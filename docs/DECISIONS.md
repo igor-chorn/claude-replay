@@ -2,6 +2,32 @@
 
 Owner of this file: planning chat. Newest first. One entry = date, decision, reason.
 
+## 2026-11-27 (after report 001)
+
+- **Recordings use a `clean` profile by default** (answers report 001, open
+  questions 1 and 2). No user-level `CLAUDE.md`, plugins or MCP servers in the
+  recorded session; the default system prompt and built-in tools stay.
+  Reason: 9 of 16 requests and part of the prompt came from this machine's
+  personal configuration (F-013); evidence must not depend on it, and P1 needs
+  a host list that is the same on any machine. MCP comes back later (group H)
+  through an explicit, controlled MCP config, not through the user's setup.
+- **Isolation must not touch credential files.** Reason: copying an OAuth
+  credential into a second config directory risks token-refresh rotation
+  logging the owner out. If `clean` is impossible under the subscription login,
+  it waits for the API key.
+- **`--bare` is a fallback only.** Reason: it changes the built-in tool set, so
+  the session would no longer be ordinary Claude Code.
+- **P2 compares ids both ways and result usage against summed final usage**
+  (F-010). Reason: the CLI's per-message usage is the `message_start` snapshot.
+- **T1 keeps the stream as received (gzip) and gets a second copy** via
+  mitmproxy's `store_streamed_bodies`. Reason: two independent copies make the
+  byte-exactness claim checkable.
+- **Proxy env also sets `HTTP_PROXY`; TLS handshake failures are recorded.**
+  Reason: both are ways traffic could escape the log unnoticed.
+- **Report 001, open question 3** (role `system` message, `tool_addition`
+  blocks, 18 beta values): no action now. Decided by D1 on the first
+  recording made with an API key.
+
 ## 2026-11-27
 
 - **Work split.** Planning in a separate chat; implementation by Claude Code on

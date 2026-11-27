@@ -52,8 +52,8 @@ behaviour. See `docs/PLAN.md` for what "complete / exact / sufficient" means.
 
 | Path | Owner |
 |---|---|
-| `CLAUDE.md`, `docs/PLAN.md`, `docs/DECISIONS.md`, `tasks/NNN-*.md` | planning chat |
-| `tools/`, `tests/`, `pyproject.toml`, `docs/FINDINGS.md`, `tasks/NNN-*.report.md` | you |
+| `CLAUDE.md`, `README.md`, `docs/PLAN.md`, `docs/DECISIONS.md`, `tasks/NNN-*.md` | planning chat |
+| `tools/`, `tests/`, `pyproject.toml`, `uv.lock`, `docs/FINDINGS.md`, `docs/HOWTO.ru.md`, `tasks/NNN-*.report.md` | you |
 
 Both sides commit to `main`. Run `git pull --rebase` before you start and before
 you push.
